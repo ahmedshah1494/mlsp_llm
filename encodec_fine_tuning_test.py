@@ -46,11 +46,11 @@ class AutoRegressiveAudioEncoder(PreTrainedModel):
         super().to(device)
         self.audio_encoder.to(device)
         self.llm.to(device)
+        print(self.audio_encoder.device, self.llm.device, self.device)
         return self
     
     def forward(self, raw_audio, *args, **kwargs):
         inputs = self.processor(raw_audio=raw_audio, sampling_rate=self.processor.sampling_rate, return_tensors="pt").to(self.device)
-        print(inputs["input_values"].device, inputs["padding_mask"].device, self.device, self.audio_encoder.device, [(n,p.device) for n,p in self.audio_encoder.named_parameters()])
         encoder_outputs = self.audio_encoder.encode(inputs["input_values"], inputs["padding_mask"])
         audio_codes = encoder_outputs.audio_codes
         audio_values = self.audio_encoder.decode(audio_codes, encoder_outputs.audio_scales, inputs["padding_mask"])[0]
@@ -99,7 +99,7 @@ if __name__ == '__main__':
         model.audio_encoder.requires_grad_(False)
     else:
         model.requires_grad_(True)
-
+    model = model.to('cuda:0')
     dataset = load_dataset(args.dataset, args.dataset_subset, split=args.dataset_split)
     dataset = dataset.cast_column("audio", Audio(sampling_rate=model.processor.sampling_rate))
     print(dataset, len(dataset))
