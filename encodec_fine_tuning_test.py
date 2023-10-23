@@ -28,15 +28,16 @@ class AutoRegressiveAudioEncoderConfig(PretrainedConfig):
 
 class AutoRegressiveAudioEncoder(PreTrainedModel):
     config_class = AutoRegressiveAudioEncoderConfig
-
+    is_parallelizable = False
+    supports_gradient_checkpointing = True
+    
     def __init__(self, config: config_class) -> None:
         super().__init__(config)
         self.config = config
-        self.supports_gradient_checkpointing = True
-        self.audio_encoder = EncodecModel.from_pretrained(config.encodec_model_name, differentiable_quantization=True)
-        self.processor = AutoProcessor.from_pretrained(config.encodec_model_name)
+        self.audio_encoder = EncodecModel.from_pretrained(config.encodec_model_name, differentiable_quantization=True, low_cpu_mem_usage=False)
+        self.processor = AutoProcessor.from_pretrained(config.encodec_model_name, low_cpu_mem_usage=False)
 
-        self.llm = OPTForCausalLM(OPTConfig.from_pretrained(config.lm_model_name, vocab_size=self.audio_encoder.config.codebook_size, max_position_embeddings=3072))
+        self.llm = OPTForCausalLM(OPTConfig.from_pretrained(config.lm_model_name, vocab_size=self.audio_encoder.config.codebook_size, max_position_embeddings=3072, low_cpu_mem_usage=False))
     
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, (EncodecModel, OPTForCausalLM)):
@@ -46,15 +47,13 @@ class AutoRegressiveAudioEncoder(PreTrainedModel):
         super().to(device)
         self.audio_encoder.to(device)
         self.llm.to(device)
-        print(self.audio_encoder.device, self.llm.device, self.device)
         return self
     
-    def forward(self, raw_audio, *args, **kwargs):
-        inputs = self.processor(raw_audio=raw_audio, sampling_rate=self.processor.sampling_rate, return_tensors="pt").to(self.device)
-        encoder_outputs = self.audio_encoder.encode(inputs["input_values"], inputs["padding_mask"])
+    def forward(self, input_values, padding_mask, *args, **kwargs):
+        encoder_outputs = self.audio_encoder.encode(input_values, padding_mask)
         audio_codes = encoder_outputs.audio_codes
-        audio_values = self.audio_encoder.decode(audio_codes, encoder_outputs.audio_scales, inputs["padding_mask"])[0]
-        recon_loss = torch.nn.functional.mse_loss(audio_values, inputs["input_values"])
+        audio_values = self.audio_encoder.decode(audio_codes, encoder_outputs.audio_scales, padding_mask)[0]
+        recon_loss = torch.nn.functional.mse_loss(audio_values, input_values)
         
         llm_embedding_matrix = self.llm.get_input_embeddings().weight
         audio_codes = audio_codes.squeeze(0).reshape(-1, audio_codes.shape[-2], audio_codes.shape[-1])
@@ -87,6 +86,7 @@ if __name__ == '__main__':
     parser.add_argument('--gradient_accumulation_steps', type=int, default=8)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--push_to_hub', action='store_true')
+    parser.add_argument('--resume_training', action='store_true')
     args = parser.parse_args()
     config = AutoRegressiveAudioEncoderConfig(lm_model_name=args.lm_model_name)
     if args.ckp_name is not None:
@@ -98,17 +98,18 @@ if __name__ == '__main__':
         model.config.recon_loss_weight = 0.0
         model.audio_encoder.requires_grad_(False)
     else:
+        model.config.recon_loss_weight = 1.0
         model.requires_grad_(True)
+    print(f'lm_pretraining: {args.lm_pretraining}, recon_loss_weight: {model.config.recon_loss_weight}, ppl_loss_weight: {model.config.ppl_loss_weight}')
     model = model.to('cuda:0')
     dataset = load_dataset(args.dataset, args.dataset_subset, split=args.dataset_split)
     dataset = dataset.cast_column("audio", Audio(sampling_rate=model.processor.sampling_rate))
     print(dataset, len(dataset))
 
     def collate_fn(batch):
-        new_batch = {
-            'raw_audio': [elem['audio']['array'] for elem in batch],
-        }
-        return new_batch
+        raw_audio = [elem['audio']['array'] for elem in batch]
+        inputs = model.processor(raw_audio=raw_audio, sampling_rate=model.processor.sampling_rate, return_tensors="pt")
+        return inputs
 
     if args.lm_pretraining:
         suffix = 'lm_pretraining'
@@ -124,7 +125,7 @@ if __name__ == '__main__':
         warmup_ratio=0.1,
         num_train_epochs=args.num_train_epochs,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        gradient_checkpointing=True,
+        gradient_checkpointing=model.supports_gradient_checkpointing,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=1,
         save_total_limit=1,
@@ -134,8 +135,8 @@ if __name__ == '__main__':
         push_to_hub=args.push_to_hub,
         hub_model_id=f"cmu-mlsp/{model_name}",
         hub_strategy='end',
-        save_strategy='epoch',
-        fsdp=False,
+        save_strategy='steps',
+        save_steps=500,
     )
     trainer = Trainer(model, train_args, train_dataset=dataset, eval_dataset=dataset, data_collator=collate_fn)
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_training)
