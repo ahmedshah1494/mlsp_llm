@@ -136,6 +136,10 @@ class EncodecConfig(PretrainedConfig):
         codebook_dim=None,
         use_conv_shortcut=True,
         differentiable_quantization=False,
+        train_discriminator=True,
+        train_encoder=True,
+        train_decoder=True,
+        compute_discriminator_loss=True,
         **kwargs,
     ):
         self.target_bandwidths = target_bandwidths
@@ -162,6 +166,10 @@ class EncodecConfig(PretrainedConfig):
         self.codebook_dim = codebook_dim if codebook_dim is not None else hidden_size
         self.use_conv_shortcut = use_conv_shortcut
         self.differentiable_quantization = differentiable_quantization
+        self.train_discriminator = train_discriminator
+        self.train_encoder = train_encoder
+        self.train_decoder = train_decoder
+        self.compute_discriminator_loss = compute_discriminator_loss
 
         if self.norm_type not in ["weight_norm", "time_group_norm"]:
             raise ValueError(

@@ -31,6 +31,8 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_encodec import EncodecConfig
+from torchaudio.transforms import MelSpectrogram
+from .msstftd import MultiScaleSTFTDiscriminator
 
 
 logger = logging.get_logger(__name__)
@@ -59,6 +61,7 @@ class EncodecOutput(ModelOutput):
 
     audio_codes: torch.FloatTensor = None
     audio_values: torch.FloatTensor = None
+    loss: torch.FloatTensor = None
 
 
 @dataclass
@@ -73,6 +76,7 @@ class EncodecEncoderOutput(ModelOutput):
 
     audio_codes: torch.FloatTensor = None
     audio_scales: torch.FloatTensor = None
+    commitment_loss: torch.FloatTensor = None
 
 
 @dataclass
@@ -435,13 +439,17 @@ class EncodecResidualVectorQuantizer(nn.Module):
         num_quantizers = self.get_num_quantizers_for_bandwidth(bandwidth)
         residual = embeddings
         all_indices = []
+        loss = 0.
         for layer in self.layers[:num_quantizers]:
             indices = layer.encode(residual)
             quantized = layer.decode(indices)
+            if self.training:
+                quantized = residual + (quantized - residual).detach()
+            loss += torch.nn.functional.mse_loss(quantized.detach(), residual)
             residual = residual - quantized
             all_indices.append(indices)
         out_indices = torch.stack(all_indices)
-        return out_indices
+        return out_indices, loss
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         """Decode the given codes to the quantized representation."""
@@ -561,6 +569,18 @@ class EncodecModel(EncodecPreTrainedModel):
         self.bits_per_codebook = int(math.log2(self.config.codebook_size))
         if 2**self.bits_per_codebook != self.config.codebook_size:
             raise ValueError("The codebook_size must be a power of 2.")
+        
+        wlens = [2**e for e in range(6,12)]
+        self.melspecs = torch.nn.ModuleList([MelSpectrogram(
+                            sample_rate=config.sampling_rate,
+                            n_fft=wlen,
+                            win_length=wlen,
+                            hop_length=wlen//4,
+                            n_mels=64,
+                            normalized=True) for wlen in wlens])
+        self.disc = MultiScaleSTFTDiscriminator(
+            config.num_filters, config.audio_channels, config.audio_channels
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -593,9 +613,9 @@ class EncodecModel(EncodecPreTrainedModel):
             input_values = input_values / scale
 
         embeddings = self.encoder(input_values)
-        codes = self.quantizer.encode(embeddings, bandwidth)
+        codes, loss = self.quantizer.encode(embeddings, bandwidth)
         codes = codes.transpose(0, 1)
-        return codes, scale
+        return codes, scale, loss
 
     def encode(
         self,
@@ -603,7 +623,7 @@ class EncodecModel(EncodecPreTrainedModel):
         padding_mask: torch.Tensor = None,
         bandwidth: Optional[float] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple[torch.Tensor, Optional[torch.Tensor]], EncodecEncoderOutput]:
+    ) -> Union[Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]], EncodecEncoderOutput]:
         """
         Encodes the input audio waveform into discrete codes.
 
@@ -659,16 +679,16 @@ class EncodecModel(EncodecPreTrainedModel):
         for offset in range(0, input_length - step, stride):
             mask = padding_mask[..., offset : offset + chunk_length].bool()
             frame = input_values[:, :, offset : offset + chunk_length]
-            encoded_frame, scale = self._encode_frame(frame, bandwidth, mask)
+            encoded_frame, scale, loss = self._encode_frame(frame, bandwidth, mask)
             encoded_frames.append(encoded_frame)
             scales.append(scale)
 
         encoded_frames = torch.stack(encoded_frames)
 
         if not return_dict:
-            return (encoded_frames, scales)
+            return (encoded_frames, scales, loss)
 
-        return EncodecEncoderOutput(encoded_frames, scales)
+        return EncodecEncoderOutput(encoded_frames, scales, loss)
 
     @staticmethod
     def _linear_overlap_add(frames: List[torch.Tensor], stride: int):
@@ -773,6 +793,42 @@ class EncodecModel(EncodecPreTrainedModel):
             return (audio_values,)
         return EncodecDecoderOutput(audio_values)
 
+    def _compute_reconstruction_loss(self, input_values: torch.Tensor, audio_values: torch.Tensor,
+                      commitment_loss: torch.Tensor, disc_outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]):
+        """Compute the loss for the given input and output tensors."""
+        loss = 0.
+        if disc_outputs is not None:
+            logits_ref, logits_pred, fmap_ref, fmap_pred = disc_outputs
+            l_feat = 0.
+            l_g = 0.
+            for tt1 in range(len(fmap_ref)): # len(fmap_ref) = 3
+                l_g = l_g + torch.mean(torch.relu(1 - logits_pred[tt1])) / len(logits_pred)
+                for tt2 in range(len(fmap_ref[tt1])): # len(fmap_ref[tt1]) = 5
+                    l_feat = l_feat + torch.nn.functional.l1_loss(fmap_ref[tt1][tt2], fmap_pred[tt1][tt2]) / torch.mean(torch.abs(fmap_ref[tt1][tt2]))
+            
+            KL_scale = len(fmap_ref)*len(fmap_ref[0]) # len(fmap_ref) == len(fmap_pred) == len(logits_real) == len(logits_pred) == disc.num_discriminators == K
+            K_scale = len(fmap_ref) # len(fmap_ref[0]) = len(fmap_pred[0]) == L
+            
+            loss = 3*l_g/K_scale + 3*l_feat/KL_scale
+
+        l_t = torch.nn.functional.l1_loss(audio_values, input_values)
+        l_f = 0.
+        for melspec in self.melspecs:
+            melspec_ref = melspec(audio_values)
+            melspec_pred = melspec(input_values)
+            l_f += torch.nn.functional.mse_loss(melspec_ref, melspec_pred) + torch.nn.functional.l1_loss(melspec_ref, melspec_pred)
+        # print(l_t.item(), l_f.item(), commitment_loss.item(), l_g.item(), l_feat.item())
+        loss += l_t*0.1 + l_f + commitment_loss
+        return loss
+
+    def _compute_discriminator_loss(self, logit_ref, logit_pred):
+        lossd = 0.
+        for tt1 in range(len(logit_ref)):
+            lossd = lossd + torch.mean(torch.relu(1-logit_ref[tt1])) + torch.mean(torch.relu(1+logit_pred[tt1]))
+        lossd = lossd / len(logit_ref)
+        return lossd
+
+
     @add_start_docstrings_to_model_forward(ENCODEC_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=EncodecOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -818,10 +874,29 @@ class EncodecModel(EncodecPreTrainedModel):
             raise ValueError("You specified `audio_scales` but did not specify the `audio_codes`")
 
         if audio_scales is None and audio_codes is None:
-            audio_codes, audio_scales = self.encode(input_values, padding_mask, bandwidth, False)
-
+            audio_codes, audio_scales, commitment_loss = self.encode(input_values, padding_mask, bandwidth, False)
+        
         audio_values = self.decode(audio_codes, audio_scales, padding_mask, return_dict=return_dict)[0]
-        if not return_dict:
-            return (audio_codes, audio_values)
 
-        return EncodecOutput(audio_codes=audio_codes, audio_values=audio_values)
+        loss = 0.
+
+        if self.config.compute_discriminator_loss or self.config.train_discriminator:
+            logits_ref, fmap_ref = self.disc(input_values)
+            logits_pred, fmap_pred = self.disc(audio_values)
+            disc_outputs = (logits_ref, logits_pred, fmap_ref, fmap_pred)
+            if self.config.train_discriminator:
+                logit_pred_detached = self.disc(audio_values.detach())[0]
+                discriminator_loss = self._compute_discriminator_loss(logits_ref, logit_pred_detached)
+                loss += discriminator_loss
+        else:
+            disc_outputs = None
+        
+        if self.config.train_encoder or self.config.train_decoder:
+            reconstruction_loss = self._compute_reconstruction_loss(input_values, audio_values, commitment_loss, disc_outputs)
+            loss += reconstruction_loss
+        if not return_dict:
+            return (audio_codes, audio_values, loss)
+
+        return EncodecOutput(audio_codes=audio_codes,
+                             audio_values=audio_values,
+                             loss=loss,)
