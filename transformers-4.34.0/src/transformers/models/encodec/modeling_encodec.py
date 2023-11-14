@@ -443,8 +443,6 @@ class EncodecResidualVectorQuantizer(nn.Module):
         for layer in self.layers[:num_quantizers]:
             indices = layer.encode(residual)
             quantized = layer.decode(indices)
-            if self.training:
-                quantized = residual + (quantized - residual).detach()
             loss += torch.nn.functional.mse_loss(quantized.detach(), residual)
             residual = residual - quantized
             all_indices.append(indices)
@@ -570,7 +568,7 @@ class EncodecModel(EncodecPreTrainedModel):
         if 2**self.bits_per_codebook != self.config.codebook_size:
             raise ValueError("The codebook_size must be a power of 2.")
         
-        wlens = [2**e for e in range(6,12)]
+        wlens = [2**e for e in range(5,12)]
         self.melspecs = torch.nn.ModuleList([MelSpectrogram(
                             sample_rate=config.sampling_rate,
                             n_fft=wlen,

@@ -46,7 +46,8 @@ class AutoRegressiveAudioEncoder(PreTrainedModel):
                                                           **config.encodec_kwargs)
         self.processor = AutoProcessor.from_pretrained(config.encodec_model_name, low_cpu_mem_usage=False)
 
-        self.llm = OPTForCausalLM(OPTConfig.from_pretrained(config.lm_model_name, vocab_size=self.audio_encoder.config.codebook_size, max_position_embeddings=3072, low_cpu_mem_usage=False, **config.llm_kwargs))
+        self.llm = OPTForCausalLM(OPTConfig.from_pretrained(config.lm_model_name, vocab_size=self.audio_encoder.config.codebook_size,
+                                                            max_position_embeddings=3072, low_cpu_mem_usage=False, **config.llm_kwargs))
     
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, (EncodecModel, OPTForCausalLM)):
@@ -128,15 +129,21 @@ if __name__ == '__main__':
     parser.add_argument('--lm_pretraining', action='store_true')
     parser.add_argument('--disc_pretraining', action='store_true')
     parser.add_argument('--update_disc', action='store_true')
+    parser.add_argument('--freeze_encoder', action='store_true')
+    parser.add_argument('--freeze_decoder', action='store_true')
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--num_train_epochs', type=int, default=1)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=8)
     parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--max_sample_len', type=int, default=None)
     parser.add_argument('--num_quantizers', type=int, default=2)
     parser.add_argument('--push_to_hub', action='store_true')
     parser.add_argument('--resume_training', action='store_true')
     parser.add_argument('--ignore_size_mismatch_in_ckp', action='store_true')
     args = parser.parse_args()
+
+    np.random.seed(42)
+
     config = AutoRegressiveAudioEncoderConfig(lm_model_name=args.lm_model_name,
                                               num_quantizers=args.num_quantizers,
                                               recon_loss_weight=args.recon_loss_weight,
@@ -171,6 +178,12 @@ if __name__ == '__main__':
         model.config.recon_loss_weight = args.recon_loss_weight
         model.requires_grad_(True)
         model.audio_encoder.disc.requires_grad_(args.update_disc)
+    
+    if args.freeze_encoder:
+        model.audio_encoder.encoder.requires_grad_(False)
+    if args.freeze_decoder:
+        model.audio_encoder.decoder.requires_grad_(False)
+
     print(f'lm_pretraining: {args.lm_pretraining}, recon_loss_weight: {model.config.recon_loss_weight}, ppl_loss_weight: {model.config.ppl_loss_weight}')
     model = model.to('cuda:0')
     dataset = [load_dataset(args.dataset, args.dataset_subset, split=split) for split in args.dataset_split]
@@ -179,10 +192,19 @@ if __name__ == '__main__':
     else:
         dataset = concatenate_datasets(dataset)
     dataset = dataset.cast_column("audio", Audio(sampling_rate=model.processor.sampling_rate))
-    print(dataset, len(dataset))
+    print(dataset, len(dataset), dataset[0]['audio']['array'].shape)
 
     def collate_fn(batch):
         raw_audio = [elem['audio']['array'] for elem in batch]
+        if args.max_sample_len is not None:
+            max_sample_frames = args.max_sample_len * model.processor.sampling_rate
+            start_idxs = []
+            for audio in raw_audio:
+                if audio.shape[-1] > max_sample_frames:
+                    start_idxs.append(np.random.randint(0, audio.shape[-1] - max_sample_frames))
+                else:
+                    start_idxs.append(0)
+            raw_audio = [audio[si:si+max_sample_frames] for audio,si in zip(raw_audio, start_idxs)]
         inputs = model.processor(raw_audio=raw_audio, sampling_rate=model.processor.sampling_rate, return_tensors="pt")
         return inputs
 
